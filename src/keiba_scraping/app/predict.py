@@ -3,25 +3,22 @@ from __future__ import annotations
 import csv
 import os
 
-from keiba_scraping.data.stub_source import StubRaceCardSource
+from keiba_scraping.data.factory import create_source
 from keiba_scraping.logic.trifecta_box import make_trifecta_box
 
 
-def run_prediction(race_id: str, select: int, out_path: str) -> None:
+def run_prediction(race_id: str, select: int, out_path: str, source: str = "stub") -> None:
     if select < 3:
         raise ValueError("--select must be >= 3")
     if select != 5:
-        # まずは要件を固定：5頭BOX=10点。将来拡張は可能。
         raise ValueError("MVP currently supports --select 5 only (10 tickets).")
 
-    source = StubRaceCardSource()
-    race = source.get_race_card(race_id)
+    race_source = create_source(source)
+    race = race_source.get_race_card(race_id)
 
-    # p_top3で上位を選抜
     top = sorted(race.horses, key=lambda h: h.p_top3, reverse=True)[:select]
 
     combos = make_trifecta_box(top)
-    # 5頭BOXなら combinations(5,3)=10点になる
     if len(combos) != 10:
         raise RuntimeError(f"Expected 10 combos, got {len(combos)}")
 
@@ -33,8 +30,8 @@ def run_prediction(race_id: str, select: int, out_path: str) -> None:
         for c in combos:
             w.writerow([race_id, *c.horse_names, f"{c.score:.6f}"])
 
-    # console output
     print(f"race_id={race_id}")
+    print(f"source={source}")
     print("selected horses:")
     for h in top:
         print(f"- {h.name} (p_top3={h.p_top3:.2f})")

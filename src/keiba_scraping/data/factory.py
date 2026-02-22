@@ -1,7 +1,15 @@
-# Data Factory
+from __future__ import annotations
 
-This module contains factory methods to create data sources.
+from keiba_scraping.data.source import RaceCardSource
+from keiba_scraping.data.stub_source import StubRaceCardSource
 
-```python
-# Implement factory methods here
-```
+
+def create_source(source_name: str) -> RaceCardSource:
+    source_name = source_name.lower().strip()
+    if source_name == "stub":
+        return StubRaceCardSource()
+
+    if source_name == "datalab":
+        raise NotImplementedError("DataLab source is not implemented yet.")
+
+    raise ValueError(f"Unknown source: {source_name}")
