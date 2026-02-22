@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
+import time 
 
+import pythoncom  # type: ignore
 import win32com.client  # type: ignore
 
 
 def invoke_open(jv, dataspec: str, fromdate: str, option: int):
-    # JVOpen returns tuple like: (ret, readcount, downloadcount, lastfiletimestamp)
     return jv._oleobj_.InvokeTypes(
         7, 0, 1,
         (3, 0),
@@ -18,7 +20,6 @@ def invoke_open(jv, dataspec: str, fromdate: str, option: int):
 
 
 def invoke_read(jv):
-    # JVRead returns tuple like: (ret, buff, size, filename)
     return jv._oleobj_.InvokeTypes(
         9, 0, 1,
         (3, 0),
@@ -26,63 +27,119 @@ def invoke_read(jv):
         "", 0, ""
     )
 
+# ...（import と invoke_open/invoke_read はそのまま）...
 
 def main() -> int:
-    dataspec = os.environ.get("JV_DATASPEC", "RA")
-    fromdate = os.environ.get("JV_FROMDATE", "20260222")
-    option = int(os.environ.get("JV_OPTION", "0"))
+    pythoncom.CoInitialize()
+    jv = None
 
-    jv = win32com.client.Dispatch("JVDTLab.JVLink")
-    init_ret = jv.JVInit(0)
-    ui_ret = jv.JVSetUIProperties()
-    savepath_ret = jv.JVSetSavePath(r"C:\ProgramData\JRA-VAN\Data")
-    saveflag_ret = jv.JVSetSaveFlag(1)
+    close_ret = None
+    payload: dict = {"ok": False}
 
-    st0 = jv.JVStatus()
+    try:
+        dataspec = os.environ.get("JV_DATASPEC", "RACE")
+        fromdate = os.environ.get("JV_FROMDATE", "20240101000000")
+        option = int(os.environ.get("JV_OPTION", "1"))
 
-    open_t = invoke_open(jv, dataspec, fromdate, option)
-    # open_t is expected: (ret, readcount, downloadcount, lastfiletimestamp)
-    open_ret, readcount, downloadcount, lastts = open_t
+        # リトライ設定（環境変数で上書き可にすると便利）
+        max_wait_sec = float(os.environ.get("JV_READ_MAX_WAIT_SEC", "60"))
+        interval_sec = float(os.environ.get("JV_READ_INTERVAL_SEC", "0.5"))
 
-    st1 = jv.JVStatus()
+        jv = win32com.client.Dispatch("JVDTLab.JVLink")
+        init_ret = jv.JVInit(0)
 
-    read_t = invoke_read(jv)
-    read_ret, buff, size, filename = read_t
+        ui_ret = None  # UIは呼ばない
 
-    st2 = jv.JVStatus()
+        savepath_ret = jv.JVSetSavePath(r"C:\ProgramData\JRA-VAN\Data")
+        saveflag_ret = jv.JVSetSaveFlag(1)
 
-    close_ret = jv.JVClose()
+        st0 = jv.JVStatus()
 
-    payload = {
-        "ok": True,
-        "setup": {
-            "init": int(init_ret),
-            "ui": int(ui_ret),
-            "savepath": int(savepath_ret),
-            "saveflag": int(saveflag_ret),
-        },
-        "status": {"before_open": int(st0), "after_open": int(st1), "after_read": int(st2)},
-        "open": {
-            "dataspec": dataspec,
-            "fromdate": fromdate,
-            "option": option,
-            "ret": int(open_ret),
-            "readcount": int(readcount),
-            "downloadcount": int(downloadcount),
-            "lastfiletimestamp": str(lastts),
-        },
-        "read": {
-            "ret": int(read_ret),
-            "size": int(size),
-            "filename": str(filename),
-            "buff_head": str(buff)[:200],
-        },
-        "close": int(close_ret),
-    }
+        open_ret, readcount, downloadcount, lastts = invoke_open(jv, dataspec, fromdate, option)
 
-    print(json.dumps(payload, ensure_ascii=False), file=sys.stdout)
-    return 0
+        st1 = jv.JVStatus()
 
+        # ここから Read をリトライ
+        attempts = []
+        found = False
+        read_ret = -9999
+        buff = ""
+        size = 0
+        filename = ""
+
+        deadline = time.time() + max_wait_sec
+        while time.time() < deadline:
+            st = int(jv.JVStatus())
+            read_ret, buff, size, filename = invoke_read(jv)
+
+            attempts.append(
+                {
+                    "status": st,
+                    "ret": int(read_ret),
+                    "size": int(size),
+                    "filename": str(filename),
+                    "buff_head": str(buff)[:30],
+                }
+            )
+
+            if int(read_ret) == 0 and int(size) > 0:
+                found = True
+                break
+
+            # -3 は待機して再試行
+            if int(read_ret) == -3:
+                time.sleep(interval_sec)
+                continue
+
+            # それ以外の負数はエラー扱いで中断
+            break
+
+        st2 = jv.JVStatus()
+
+        payload = {
+            "ok": True,
+            "setup": {
+                "init": int(init_ret),
+                "ui": ui_ret,
+                "savepath": int(savepath_ret),
+                "saveflag": int(saveflag_ret),
+            },
+            "status": {"before_open": int(st0), "after_open": int(st1), "after_read": int(st2)},
+            "open": {
+                "dataspec": dataspec,
+                "fromdate": fromdate,
+                "option": option,
+                "ret": int(open_ret),
+                "readcount": int(readcount),
+                "downloadcount": int(downloadcount),
+                "lastfiletimestamp": str(lastts),
+            },
+            "read": {
+                "found": bool(found),
+                "ret": int(read_ret),
+                "size": int(size),
+                "filename": str(filename),
+                "buff_head": str(buff)[:200],
+                "attempts_tail": attempts[-10:],  # 直近10回だけ
+            },
+            "close": None,
+        }
+        return 0
+
+    finally:
+        try:
+            if jv is not None:
+                close_ret = int(jv.JVClose())
+        except Exception:
+            close_ret = -9999
+
+        jv = None
+        gc.collect()
+        pythoncom.CoUninitialize()
+
+        if isinstance(payload, dict):
+            payload["close"] = close_ret
+            print(json.dumps(payload, ensure_ascii=False), file=sys.stdout)
 
 if __name__ == "__main__":
     raise SystemExit(main())
