@@ -17,6 +17,13 @@ set JV_OPTION=1
 set JV_SAVE_PATH=C:\\ProgramData\\JRA-VAN\\Data
 set JV_READ_MAX_WAIT_SEC=60
 set JV_READ_INTERVAL_SEC=0.5
+
+# Diagnostics / robustness env vars:
+set JV_SLEEP_AFTER_OPEN_SEC=1.0
+set JV_ENABLE_UI_PROPERTIES=1
+set JV_ENABLE_STATUS_POLL=1
+set JV_STATUS_POLL_MAX_WAIT_SEC=10
+set JV_STATUS_POLL_INTERVAL_SEC=0.5
 python tools/jvlink32/jvread_via_bridge.py
 
 # Or pass positional args (dataspec fromdate option):
@@ -90,25 +97,35 @@ def run_bridge(
         env=env,
     )
 
+    stderr_text = proc.stderr.strip()
+
     if proc.returncode not in (0, 1):
         raise RuntimeError(
-            f"JVLinkBridge exited with code {proc.returncode}.\n"
-            f"stderr: {proc.stderr}"
+            f"JVLinkBridge exited with unexpected code {proc.returncode}.\n"
+            f"stderr: {stderr_text or '(empty)'}"
         )
 
     stdout = proc.stdout.strip()
     if not stdout:
         raise RuntimeError(
             f"JVLinkBridge produced no output (exit {proc.returncode}).\n"
-            f"stderr: {proc.stderr}"
+            f"stderr: {stderr_text or '(empty)'}"
         )
 
     try:
-        return json.loads(stdout)
+        result = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"JVLinkBridge output is not valid JSON: {exc}\nraw: {stdout!r}"
+            f"JVLinkBridge output is not valid JSON: {exc}\n"
+            f"raw stdout: {stdout!r}\n"
+            f"stderr: {stderr_text or '(empty)'}"
         ) from exc
+
+    # Attach stderr to the result dict so callers can inspect it
+    if stderr_text:
+        result.setdefault("stderr", stderr_text)
+
+    return result
 
 
 def main() -> int:
@@ -127,7 +144,19 @@ def main() -> int:
         return 2
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        # Print a brief diagnostic hint to stderr so it doesn't pollute JSON stdout
+        stage   = result.get("stage", "unknown")
+        hresult = result.get("hresult", "")
+        error   = result.get("error", "")
+        hint = f"[jvread_via_bridge] Bridge failed at stage={stage!r}"
+        if hresult:
+            hint += f" hresult={hresult}"
+        if error:
+            hint += f": {error}"
+        print(hint, file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
