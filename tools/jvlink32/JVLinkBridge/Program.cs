@@ -264,6 +264,11 @@ try
                 result.Stage = "read";
                 D("STEP read: entering JVRead loop");
 
+                // Cast to safe interface so JVRead receives pre-allocated BSTR buffers.
+                // IJVLinkSafe shares the same COM GUID as IJVLink; the RCW resolves to
+                // the same interface pointer via QueryInterface.
+                var jvSafe = (IJVLinkSafe)(object)jv;
+
                 bool found = false;
                 int readRet = -9999;
                 int size = 0;
@@ -272,14 +277,37 @@ try
                 var deadline = DateTime.UtcNow.AddSeconds(maxWaitSec);
                 var attempts = new List<AttemptInfo>();
 
+                // Pre-allocate buffer templates once; they are reused each iteration
+                // so the CLR marshals a pre-sized BSTR on each call without repeated
+                // large managed-string allocations.
+                const int JvReadBufferSize    = 1 * 1024 * 1024; // 1 MB
+                const int JvFilenameSize      = 260;              // MAX_PATH
+                string buffTemplate           = new string('\0', JvReadBufferSize);
+                string filenameTemplate       = new string('\0', JvFilenameSize);
+
                 while (DateTime.UtcNow < deadline)
                 {
-                    buff = "";
-                    size = 0;
-                    filename = "";
+                    // Reset to pre-allocated templates so JVRead receives a large BSTR.
+                    buff     = buffTemplate;
+                    size     = 0;
+                    filename = filenameTemplate;
 
-                    D("STEP read: about to invoke JVRead");
-                    readRet = jv.JVRead(out buff, out size, out filename);
+                    D("STEP read: about to invoke JVRead (safe pre-allocated)");
+                    readRet = jvSafe.JVRead(ref buff, ref size, ref filename);
+
+                    // Trim filename at first null char (small buffer, cheap scan).
+                    int fnEnd = filename.IndexOf('\0');
+                    if (fnEnd >= 0) filename = filename[..fnEnd];
+
+                    // Trim buff using the returned size (avoids scanning the full 1 MB).
+                    // Fall back to null-char search only when size is absent or out of range.
+                    if (size > 0 && size <= buff.Length)
+                        buff = buff[..size];
+                    else
+                    {
+                        int bEnd = buff.IndexOf('\0');
+                        if (bEnd >= 0) buff = buff[..bEnd];
+                    }
 
                     D($"STEP read: JVRead ret={readRet}, size={size}, filename={PreviewArg(filename)}, buff={PreviewArg(buff)}");
 
@@ -421,6 +449,23 @@ record AttemptInfo
     public int?     Truncated             { get; set; }
     public string[] ReadArgsTypes         { get; set; } = [];
     public string[] ReadArgsValuesPreview { get; set; } = [];
+}
+
+// ── Safe COM interface for JVRead ────────────────────────────────────────────
+// Defines JVRead with [MarshalAs(UnmanagedType.BStr)] ref string parameters so
+// the CLR passes pre-allocated BSTR buffers rather than null pointers.  The
+// GUID matches the IJVLink interface; the RCW resolves via QueryInterface to the
+// same underlying COM pointer.
+
+[ComImport]
+[Guid("2AB1774C-0C41-11D7-916F-0003479BEB3F")]
+[InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
+interface IJVLinkSafe
+{
+    int JVRead(
+        [MarshalAs(UnmanagedType.BStr)] ref string buff,
+        ref int size,
+        [MarshalAs(UnmanagedType.BStr)] ref string filename);
 }
 
 // ── IDispatch introspection (to confirm runtime signature of JVRead) ─────────
