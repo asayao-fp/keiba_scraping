@@ -10,4 +10,11 @@
     <AssemblyName>JVLinkBridge</AssemblyName>
   </PropertyGroup>
 
+  <ItemGroup>
+    <Reference Include="Interop.JVDTLab">
+      <HintPath>Interop.JVDTLab.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+  </ItemGroup>
+
 </Project>
