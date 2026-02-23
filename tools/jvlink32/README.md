@@ -56,11 +56,12 @@ $env:JV_READ_INTERVAL_SEC = "0.5"
 .\JVLinkBridge.exe RACE 20240101000000 1
 ```
 
-### 出力 JSON の例
+### 出力 JSON の例（正常時）
 
 ```json
 {
   "ok": true,
+  "stage": "close",
   "setup": { "init": 0, "save_path": 0, "save_flag": 0, "pay_flag": 0 },
   "open": {
     "dataspec": "RACE",
@@ -83,8 +84,44 @@ $env:JV_READ_INTERVAL_SEC = "0.5"
 }
 ```
 
-JSONには少なくとも `open.ret`, `open.readcount`, `open.downloadcount`,
+### 出力 JSON の例（エラー時）
+
+```json
+{
+  "ok": false,
+  "stage": "read",
+  "hresult": "0x80010105",
+  "error": "The server threw an exception. (Exception from HRESULT: 0x80010105 (RPC_E_SERVERFAULT))",
+  "setup": { "init": 0, "save_path": 0, "save_flag": 0, "pay_flag": 0 },
+  "open": { "ret": 0, "readcount": 0, "downloadcount": 0, "lastfiletimestamp": "" },
+  "status_poll": [
+    { "timestamp": "2026-02-23T02:00:00.000Z", "status": 1 },
+    { "timestamp": "2026-02-23T02:00:00.500Z", "status": 0 }
+  ]
+}
+```
+
+JSONには少なくとも `ok`, `stage`, `open.ret`, `open.readcount`, `open.downloadcount`,
 `read.ret`, `read.size`, `read.filename`, `close` が含まれます。
+エラー時は `stage`, `hresult`（COMException の場合）, `error` が追加されます。
+
+---
+
+## 環境変数一覧
+
+| 変数名 | デフォルト | 説明 |
+|---|---|---|
+| `JV_DATASPEC` | `RACE` | JVOpen の dataspec |
+| `JV_FROMDATE` | `20240101000000` | JVOpen の fromdate |
+| `JV_OPTION` | `1` | JVOpen の option |
+| `JV_SAVE_PATH` | `C:\ProgramData\JRA-VAN\Data` | JVSetSavePath のパス |
+| `JV_READ_MAX_WAIT_SEC` | `60` | JVRead リトライの最大待機時間（秒） |
+| `JV_READ_INTERVAL_SEC` | `0.5` | JVRead リトライ間隔（秒） |
+| `JV_SLEEP_AFTER_OPEN_SEC` | `1.0` | JVOpen 後、JVRead 前のスリープ時間（秒）。`0` で無効化 |
+| `JV_ENABLE_UI_PROPERTIES` | `0` | `1` にすると `JVSetUIProperties` をデフォルト値で呼び出す |
+| `JV_ENABLE_STATUS_POLL` | `0` | `1` にすると JVOpen 後に `JVStatus` を繰り返しポーリングする |
+| `JV_STATUS_POLL_MAX_WAIT_SEC` | `10` | `JVStatus` ポーリングの最大待機時間（秒） |
+| `JV_STATUS_POLL_INTERVAL_SEC` | `0.5` | `JVStatus` ポーリング間隔（秒） |
 
 ---
 
@@ -100,6 +137,9 @@ python tools\jvlink32\jvread_via_bridge.py
 # 位置引数で制御
 python tools\jvlink32\jvread_via_bridge.py RACE 20240101000000 1
 ```
+
+`ok=false` のとき、ラッパーはエラー内容（stage, hresult, error）を stderr に出力し、
+終了コード 1 を返します。JSON 本体は stdout に出力されます。
 
 ---
 
@@ -137,3 +177,37 @@ x86 ターゲットの SDK が必要です。以下を確認してください:
 ```powershell
 dotnet --list-sdks
 ```
+
+### `RPC_E_SERVERFAULT (0x80010105)` が `JVRead` で発生する
+
+`JVRead` で `COMException: 0x80010105` が発生する場合、以下の手順で診断情報を収集してください。
+
+#### ステップ 1: 診断モードで実行
+
+```powershell
+$env:JV_SLEEP_AFTER_OPEN_SEC     = "3"   # JVOpen 後に 3 秒待機
+$env:JV_ENABLE_STATUS_POLL       = "1"   # JVStatus をポーリングして状態遷移を確認
+$env:JV_STATUS_POLL_MAX_WAIT_SEC = "15"
+$env:JV_STATUS_POLL_INTERVAL_SEC = "1"
+$env:JV_ENABLE_UI_PROPERTIES     = "1"   # JVSetUIProperties を呼び出す（環境によって有効）
+.\JVLinkBridge.exe RACE 20240101000000 1
+```
+
+出力 JSON の `status_poll` フィールドで、`JVStatus` の遷移を確認します。
+`status=0` が現れる前に `JVRead` を呼び出すとサーバーフォルトが発生することがあります。
+
+#### ステップ 2: JSON のフィールドを確認
+
+| フィールド | 意味 |
+|---|---|
+| `stage` | エラーが発生した段階（`init` / `open` / `status_poll` / `read` / `close`） |
+| `hresult` | COMException の HRESULT 値（例: `0x80010105`） |
+| `error` | エラーメッセージ |
+| `open.readcount` | `JVOpen` が返したレコード数（0 の場合はデータなし） |
+| `status_poll` | `JVStatus` のポーリング結果（`JV_ENABLE_STATUS_POLL=1` のとき） |
+
+#### ステップ 3: JV-Link の状態を確認
+
+- JV-Link の設定ダイアログ（タスクトレイアイコン）を一度開いてサービスキーを確認する
+- OS を再起動してから再試行する
+- JV-Link を再インストールする
