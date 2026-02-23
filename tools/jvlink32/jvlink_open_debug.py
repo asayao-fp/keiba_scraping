@@ -26,21 +26,9 @@ def invoke_open(jv, dataspec: str, fromdate: str, option: int):
         dataspec, fromdate, option, 0, 0, ""
     )
 
-"""
-def invoke_read(jv):
-    return jv._oleobj_.InvokeTypes(
-        9, 0, 1,
-        (3, 0),
-        ((16392, 2), (16387, 2), (16392, 2)),
-        "", 0, ""
-    )
-"""
-
 def invoke_read(jv):
     # makepyラッパに任せる（クラッシュ回避狙い）
     return jv.JVRead()
-
-# ...（import と invoke_open/invoke_read はそのまま）...
 
 def main() -> int:
     pythoncom.CoInitialize()
@@ -76,7 +64,7 @@ def main() -> int:
         time.sleep(3)
         read_ret, buff, size, filename = invoke_read(jv)
 
-        log({"step": "open_ok", "read_ret": int(read_ret), "filename": int(filename)})
+        log({"step": "open_ok", "read_ret": int(read_ret), "filename": str(filename)})
 
         st1 = jv.JVStatus()
 
