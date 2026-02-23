@@ -26,7 +26,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-
+using System.Threading;
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 static string Env(string key, string fallback) =>
@@ -101,300 +101,296 @@ Console.OutputEncoding = Encoding.UTF8;
 // ── COM activation ───────────────────────────────────────────────────────────
 
 var result = new BridgeResult();
-
 try
 {
-    D("STEP 0: program start");
-    D("apartment=" + Thread.CurrentThread.GetApartmentState());
-    D($"params: dataspec={dataspec}, fromdate={fromdate}, option={option}, savePath={savePath}");
-    D($"flags: enableUiProperties={enableUiProperties}, enableStatusPoll={enableStatusPoll}, requireStatusZero={requireStatusZero}");
-
-    D("STEP 1: Type.GetTypeFromProgID(JVDTLab.JVLink)");
-    Type jvType = Type.GetTypeFromProgID("JVDTLab.JVLink")
-        ?? throw new InvalidOperationException("JVDTLab.JVLink ProgID not found. Is JV-Link installed?");
-
-    D($"STEP 2: Activator.CreateInstance({jvType.FullName})");
-    object jv = Activator.CreateInstance(jvType)
-        ?? throw new InvalidOperationException("Failed to create JVDTLab.JVLink instance.");
-
-    dynamic djv = jv;
-    D("STEP 3: COM instance created");
-
-    if (debugSteps)
+    StaRunner.Run(() =>
     {
-        D("STEP 3.1: Dump IDispatch signature (if available)");
-        DispatchIntrospection.DumpDispatchSignature(jv, D);
-    }
+        D("STEP 0: program start");
+        D("apartment=" + Thread.CurrentThread.GetApartmentState());
+        D($"params: dataspec={dataspec}, fromdate={fromdate}, option={option}, savePath={savePath}");
+        D($"flags: enableUiProperties={enableUiProperties}, enableStatusPoll={enableStatusPoll}, requireStatusZero={requireStatusZero}");
 
-    object? Invoke(string method, params object[] p)
-    {
-        D($"CALL {method} args: {string.Join(", ", p.Select(PreviewArg))}");
-        var ret = jvType.InvokeMember(method, BindingFlags.InvokeMethod, null, jv, p);
-        D($"RET  {method} => {PreviewArg(ret)}");
-        return ret;
-    }
-    // ── setup ────────────────────────────────────────────────────────────────
-    result.Stage = "init";
+        D("STEP 1: Type.GetTypeFromProgID(JVDTLab.JVLink)");
+        Type jvType = Type.GetTypeFromProgID("JVDTLab.JVLink")
+            ?? throw new InvalidOperationException("JVDTLab.JVLink ProgID not found. Is JV-Link installed?");
 
-    D("STEP init: JVInit");
-    int initRet      = (int)(Invoke("JVInit",        0)        ?? -9999);
+        D($"STEP 2: Activator.CreateInstance({jvType.FullName})");
+        object jv = Activator.CreateInstance(jvType)
+            ?? throw new InvalidOperationException("Failed to create JVDTLab.JVLink instance.");
 
-    D("STEP init: JVSetSavePath");
-    int savePathRet  = (int)(Invoke("JVSetSavePath", savePath) ?? -9999);
+        dynamic djv = jv;
+        D("STEP 3: COM instance created");
 
-    D("STEP init: JVSetSaveFlag");
-    int saveFlagRet  = (int)(Invoke("JVSetSaveFlag", 1)        ?? -9999);
-
-    D("STEP init: JVSetPayFlag");
-    int payFlagRet   = (int)(Invoke("JVSetPayFlag",  0)        ?? -9999);
-
-    // ── optional UI properties ────────────────────────────────────────────────
-    int? uiPropertiesRet = null;
-    if (enableUiProperties)
-    {
-        D("STEP init: JVSetUIProperties (optional)");
-        try
+        if (debugSteps)
         {
-            uiPropertiesRet = (int)(Invoke("JVSetUIProperties") ?? -9999);
-        }
-        catch (Exception uiEx)
-        {
-            uiPropertiesRet = -9999;
-            result.UiPropertiesError = uiEx.Message;
-            D("STEP init: JVSetUIProperties exception: " + uiEx);
-        }
-    }
-
-    result.Setup = new SetupInfo
-    {
-        Init         = initRet,
-        SavePath     = savePathRet,
-        SaveFlag     = saveFlagRet,
-        PayFlag      = payFlagRet,
-        UiProperties = uiPropertiesRet,
-    };
-
-    // ── JVOpen ───────────────────────────────────────────────────────────────
-    result.Stage = "open";
-    object[] openArgs = [dataspec, fromdate, option, 0, 0, ""];
-    D("STEP open: before JVOpen openArgs=" + string.Join(", ", openArgs.Select(PreviewArg)));
-
-    var openPm = new ParameterModifier(6);
-    openPm[0] = false;
-    openPm[1] = false;
-    openPm[2] = false;
-    openPm[3] = true;
-    openPm[4] = true;
-    openPm[5] = true;
-
-    int openRet = (int)(jvType.InvokeMember("JVOpen",
-        BindingFlags.InvokeMethod,
-        null, jv, openArgs, [openPm], null, null) ?? -9999);
-
-    D("STEP open: after  JVOpen openArgs=" + string.Join(", ", openArgs.Select(PreviewArg)));
-
-    int readcount     = Convert.ToInt32(openArgs[3]);
-    int downloadcount = Convert.ToInt32(openArgs[4]);
-    string lastts     = Convert.ToString(openArgs[5]) ?? "";
-
-    result.Open = new OpenInfo
-    {
-        Dataspec          = dataspec,
-        Fromdate          = fromdate,
-        Option            = option,
-        Ret               = openRet,
-        Readcount         = readcount,
-        Downloadcount     = downloadcount,
-        Lastfiletimestamp = lastts,
-    };
-
-    if (openRet < 0)
-    {
-        result.Ok    = false;
-        result.Error = $"JVOpen returned {openRet}";
-        D($"STEP open: openRet={openRet} (error)");
-    }
-    else
-    {
-        if (sleepAfterOpenSec > 0)
-        {
-            D($"STEP post_open_sleep: sleeping {sleepAfterOpenSec}s");
-            Thread.Sleep((int)(sleepAfterOpenSec * 1000));
+            D("STEP 3.1: Dump IDispatch signature (if available)");
+            DispatchIntrospection.DumpDispatchSignature(jv, D);
         }
 
-        var statusSnapshots = new List<StatusSnapshot>();
-        if (enableStatusPoll || requireStatusZero)
+        object? Invoke(string method, params object[] p)
         {
-            result.Stage = "status_poll";
-            D("STEP status_poll: entering");
-            var pollDeadline = DateTime.UtcNow.AddSeconds(statusPollMaxWaitSec);
-            while (DateTime.UtcNow < pollDeadline)
+            D($"CALL {method} args: {string.Join(", ", p.Select(PreviewArg))}");
+            var ret = jvType.InvokeMember(method, BindingFlags.InvokeMethod, null, jv, p);
+            D($"RET  {method} => {PreviewArg(ret)}");
+            return ret;
+        }
+
+        // ── setup ────────────────────────────────────────────────────────────────
+        result.Stage = "init";
+
+        D("STEP init: JVInit");
+        int initRet = (int)(Invoke("JVInit", 0) ?? -9999);
+
+        D("STEP init: JVSetSavePath");
+        int savePathRet = (int)(Invoke("JVSetSavePath", savePath) ?? -9999);
+
+        D("STEP init: JVSetSaveFlag");
+        int saveFlagRet = (int)(Invoke("JVSetSaveFlag", 1) ?? -9999);
+
+        D("STEP init: JVSetPayFlag");
+        int payFlagRet = (int)(Invoke("JVSetPayFlag", 0) ?? -9999);
+
+        // ── optional UI properties ────────────────────────────────────────────────
+        int? uiPropertiesRet = null;
+        if (enableUiProperties)
+        {
+            D("STEP init: JVSetUIProperties (optional)");
+            try
             {
-                int statusRet;
-                try
+                uiPropertiesRet = (int)(Invoke("JVSetUIProperties") ?? -9999);
+            }
+            catch (Exception uiEx)
+            {
+                uiPropertiesRet = -9999;
+                result.UiPropertiesError = uiEx.Message;
+                D("STEP init: JVSetUIProperties exception: " + uiEx);
+            }
+        }
+
+        result.Setup = new SetupInfo
+        {
+            Init = initRet,
+            SavePath = savePathRet,
+            SaveFlag = saveFlagRet,
+            PayFlag = payFlagRet,
+            UiProperties = uiPropertiesRet,
+        };
+
+        // ── JVOpen ───────────────────────────────────────────────────────────────
+        result.Stage = "open";
+        object[] openArgs = [dataspec, fromdate, option, 0, 0, ""];
+        D("STEP open: before JVOpen openArgs=" + string.Join(", ", openArgs.Select(PreviewArg)));
+
+        var openPm = new ParameterModifier(6);
+        openPm[0] = false;
+        openPm[1] = false;
+        openPm[2] = false;
+        openPm[3] = true;
+        openPm[4] = true;
+        openPm[5] = true;
+
+        int openRet = (int)(jvType.InvokeMember("JVOpen",
+            BindingFlags.InvokeMethod,
+            null, jv, openArgs, [openPm], null, null) ?? -9999);
+
+        D("STEP open: after  JVOpen openArgs=" + string.Join(", ", openArgs.Select(PreviewArg)));
+
+        int readcount = Convert.ToInt32(openArgs[3]);
+        int downloadcount = Convert.ToInt32(openArgs[4]);
+        string lastts = Convert.ToString(openArgs[5]) ?? "";
+
+        result.Open = new OpenInfo
+        {
+            Dataspec = dataspec,
+            Fromdate = fromdate,
+            Option = option,
+            Ret = openRet,
+            Readcount = readcount,
+            Downloadcount = downloadcount,
+            Lastfiletimestamp = lastts,
+        };
+
+        if (openRet < 0)
+        {
+            result.Ok = false;
+            result.Error = $"JVOpen returned {openRet}";
+            D($"STEP open: openRet={openRet} (error)");
+        }
+        else
+        {
+            if (sleepAfterOpenSec > 0)
+            {
+                D($"STEP post_open_sleep: sleeping {sleepAfterOpenSec}s");
+                Thread.Sleep((int)(sleepAfterOpenSec * 1000));
+            }
+
+            var statusSnapshots = new List<StatusSnapshot>();
+            if (enableStatusPoll || requireStatusZero)
+            {
+                result.Stage = "status_poll";
+                D("STEP status_poll: entering");
+                var pollDeadline = DateTime.UtcNow.AddSeconds(statusPollMaxWaitSec);
+                while (DateTime.UtcNow < pollDeadline)
                 {
-                    D("CALL JVStatus");
-                    statusRet = (int)(Invoke("JVStatus") ?? -9999);
-                    D($"RET  JVStatus => {statusRet}");
-                }
-                catch (COMException comEx)
-                {
-                    D("STEP status_poll: COMException: " + comEx);
+                    int statusRet;
+                    try
+                    {
+                        D("CALL JVStatus");
+                        statusRet = (int)(Invoke("JVStatus") ?? -9999);
+                        D($"RET  JVStatus => {statusRet}");
+                    }
+                    catch (COMException comEx)
+                    {
+                        D("STEP status_poll: COMException: " + comEx);
+                        statusSnapshots.Add(new StatusSnapshot
+                        {
+                            Timestamp = DateTime.UtcNow.ToString("o"),
+                            Status = -9999,
+                            Error = comEx.Message,
+                            Hresult = $"0x{(uint)comEx.ErrorCode:X8}",
+                        });
+                        break;
+                    }
+
                     statusSnapshots.Add(new StatusSnapshot
                     {
                         Timestamp = DateTime.UtcNow.ToString("o"),
-                        Status    = -9999,
-                        Error     = comEx.Message,
-                        Hresult   = $"0x{(uint)comEx.ErrorCode:X8}",
+                        Status = statusRet,
                     });
-                    break;
+
+                    if (statusRet == 0) break;
+                    Thread.Sleep((int)(statusPollIntervalSec * 1000));
                 }
-                statusSnapshots.Add(new StatusSnapshot
-                {
-                    Timestamp = DateTime.UtcNow.ToString("o"),
-                    Status    = statusRet,
-                });
-                if (statusRet == 0) break;
-                Thread.Sleep((int)(statusPollIntervalSec * 1000));
+
+                result.StatusPoll = statusSnapshots;
+                D("STEP status_poll: done");
             }
-            result.StatusPoll = statusSnapshots;
-            D("STEP status_poll: done");
-        }
 
-        bool proceedToRead = true;
-        if (requireStatusZero)
-        {
-            bool statusZeroSeen = statusSnapshots.Any(s => s.Status == 0);
-            if (!statusZeroSeen)
+            bool proceedToRead = true;
+            if (requireStatusZero)
             {
-                result.Ok    = false;
-                result.Stage = "status_poll";
-                result.Error = "JVStatus did not reach 0 within the poll window; JVRead not attempted (JV_READ_REQUIRE_STATUS_ZERO=1)";
-                proceedToRead = false;
-                D("STEP gate: status 0 not seen; skipping JVRead");
-            }
-        }
-
-        if (proceedToRead)
-        {
-            result.Stage = "read";
-            D("STEP read: entering JVRead loop");
-
-            bool found       = false;
-            int  readRet     = -9999;
-            int  size        = 0;
-            string buff      = "";
-            string filename  = "";
-            var deadline     = DateTime.UtcNow.AddSeconds(maxWaitSec);
-            var attempts     = new List<AttemptInfo>();
-
-            while (DateTime.UtcNow < deadline)
-            {
-
-                // JVRead loop body (dynamic/ref object to avoid InvokeMember byref issues)
-                object b = "";
-                object s = 0;
-                object f = "";
-
-                D("STEP read: about to invoke JVRead (dynamic/ref)");
-                try
+                bool statusZeroSeen = statusSnapshots.Any(s => s.Status == 0);
+                if (!statusZeroSeen)
                 {
-                    // Many COM servers behave better with dynamic dispatch than InvokeMember+ParameterModifier
-                    readRet = Convert.ToInt32(djv.JVRead(ref b, ref s, ref f));
+                    result.Ok = false;
+                    result.Stage = "status_poll";
+                    result.Error = "JVStatus did not reach 0 within the poll window; JVRead not attempted (JV_READ_REQUIRE_STATUS_ZERO=1)";
+                    proceedToRead = false;
+                    D("STEP gate: status 0 not seen; skipping JVRead");
                 }
-                catch (Exception ex)
+            }
+
+            if (proceedToRead)
+            {
+                result.Stage = "read";
+                D("STEP read: entering JVRead loop");
+
+                bool found = false;
+                int readRet = -9999;
+                int size = 0;
+                string buff = "";
+                string filename = "";
+                var deadline = DateTime.UtcNow.AddSeconds(maxWaitSec);
+                var attempts = new List<AttemptInfo>();
+
+                while (DateTime.UtcNow < deadline)
                 {
-                    D("STEP read: JVRead threw managed exception (dynamic): " + ex);
+                    object b = "";
+                    object s = 0;
+                    object f = "";
+
+                    // JVRead loop body (InvokeMember + ParameterModifier; run under STA)
+                    var readArgs = new object[] { "", 0, "" };
+                    var pm = new ParameterModifier(3);
+                    pm[0] = true; pm[1] = true; pm[2] = true;
+
+                    D("STEP read: about to invoke JVRead (InvokeMember/pm)");
+                    try
+                    {
+                        readRet = (int)(jvType.InvokeMember(
+                            "JVRead",
+                            BindingFlags.InvokeMethod,
+                            null,
+                            jv,
+                            readArgs,
+                            [pm],
+                            null,
+                            null) ?? -9999);
+                    }
+                    catch (Exception ex)
+                    {
+                        D("STEP read: JVRead threw managed exception (InvokeMember): " + ex);
+                        throw;
+                    }
+
+                    buff     = Convert.ToString(readArgs[0]) ?? "";
+                    size     = Convert.ToInt32(readArgs[1]);
+                    filename = Convert.ToString(readArgs[2]) ?? "";
+
+                    D($"STEP read: JVRead ret={readRet}, size={size}, filename={PreviewArg(filename)}, buff={PreviewArg(buff)}");
+
+
+                    D($"STEP read: JVRead ret={readRet}, size={size}, filename={PreviewArg(filename)}, buff={PreviewArg(buff)}");
+
                     attempts.Add(new AttemptInfo
                     {
-                        Ret                   = readRet,
-                        Size                  = 0,
-                        Filename              = "",
-                        BuffHead              = "",
-                        ReadArgsTypes         = [b?.GetType().FullName ?? "null", s?.GetType().FullName ?? "null", f?.GetType().FullName ?? "null"],
-                        ReadArgsValuesPreview = GetReadArgsPreview(0, "", ""),
+                        Ret = readRet,
+                        Size = size,
+                        Filename = filename,
+                        BuffHead = buff.Length > 30 ? buff[..30] : buff,
+                        BufferPreview = buff.Length > 200 ? buff[..200] : buff,
+                        ReadArgsTypes = [b?.GetType().FullName ?? "null", s?.GetType().FullName ?? "null", f?.GetType().FullName ?? "null"],
+                        ReadArgsValuesPreview = GetReadArgsPreview(size, filename, buff),
                     });
-                    result.Read = new ReadInfo
-                    {
-                        Found        = false,
-                        Ret          = readRet,
-                        Size         = 0,
-                        Filename     = "",
-                        BuffHead     = "",
-                        AttemptsTail = attempts.Count > 10 ? attempts[^10..] : attempts,
-                    };
-                    throw;
+
+                    if (readRet == 0 && size > 0) { found = true; break; }
+                    if (readRet == -3) { Thread.Sleep((int)(intervalSec * 1000)); continue; }
+                    break;
                 }
 
-                buff     = Convert.ToString(b) ?? "";
-                size     = Convert.ToInt32(s);
-                filename = Convert.ToString(f) ?? "";
-
-                D($"STEP read: JVRead ret={readRet}, size={size}, filename={PreviewArg(filename)}, buff={PreviewArg(buff)}");
-
-                attempts.Add(new AttemptInfo
+                result.Read = new ReadInfo
                 {
-                    Ret                   = readRet,
-                    Size                  = size,
-                    Filename              = filename,
-                    BuffHead              = buff.Length > 30 ? buff[..30] : buff,
-                    BufferPreview         = buff.Length > 200 ? buff[..200] : buff,
-                    ReadArgsTypes         = [b?.GetType().FullName ?? "null", s?.GetType().FullName ?? "null", f?.GetType().FullName ?? "null"],
-                    ReadArgsValuesPreview = GetReadArgsPreview(size, filename, buff),
-                });
+                    Found = found,
+                    Ret = readRet,
+                    Size = size,
+                    Filename = filename,
+                    BuffHead = buff.Length > 200 ? buff[..200] : buff,
+                    AttemptsTail = attempts.Count > 10 ? attempts[^10..] : attempts,
+                };
 
-                if (readRet == 0 && size > 0) { found = true; break; }
-                if (readRet == -3) { Thread.Sleep((int)(intervalSec * 1000)); continue; }
-                break;
-
-
-
-
-            }
-
-            result.Read = new ReadInfo
-            {
-                Found        = found,
-                Ret          = readRet,
-                Size         = size,
-                Filename     = filename,
-                BuffHead     = buff.Length > 200 ? buff[..200] : buff,
-                AttemptsTail = attempts.Count > 10 ? attempts[^10..] : attempts,
-            };
-
-            if (!found && readRet != 0)
-            {
-                result.Error = $"JVRead returned {readRet}; size={size}; filename={filename}";
-                D("STEP read: not found; " + result.Error);
+                if (!found && readRet != 0)
+                {
+                    result.Error = $"JVRead returned {readRet}; size={size}; filename={filename}";
+                    D("STEP read: not found; " + result.Error);
+                }
             }
         }
-    }
 
-    string? savedErrorStage = result.Error is not null ? result.Stage : null;
-    result.Stage = "close";
+        string? savedErrorStage = result.Error is not null ? result.Stage : null;
+        result.Stage = "close";
 
-    D("STEP close: JVClose");
-    result.Close = (int)(Invoke("JVClose") ?? -9999);
-    D("STEP close: JVClose done");
+        D("STEP close: JVClose");
+        result.Close = (int)(Invoke("JVClose") ?? -9999);
+        D("STEP close: JVClose done");
 
-    result.Ok = result.Error is null;
+        result.Ok = result.Error is null;
+        if (savedErrorStage is not null) result.Stage = savedErrorStage;
 
-    if (savedErrorStage is not null) result.Stage = savedErrorStage;
-
-    D("STEP final: ReleaseComObject");
-    Marshal.ReleaseComObject(jv);
-    D("STEP final: done");
+        D("STEP final: ReleaseComObject");
+        Marshal.ReleaseComObject(jv);
+        D("STEP final: done");
+    });
 }
 catch (COMException comEx)
 {
-    result.Ok      = false;
+    result.Ok = false;
     result.Hresult = $"0x{(uint)comEx.ErrorCode:X8}";
-    result.Error   = comEx.Message;
+    result.Error = comEx.Message;
     D("CATCH COMException: " + comEx);
 }
 catch (Exception ex)
 {
-    result.Ok    = false;
+    result.Ok = false;
     result.Error = ex.ToString();
     D("CATCH Exception: " + ex);
 }
@@ -536,5 +532,26 @@ static class DispatchIntrospection
         {
             log("DumpDispatchSignature failed: " + ex);
         }
+    }
+}
+
+static class StaRunner
+{
+    public static void Run(Action action)
+    {
+        Exception? caught = null;
+
+        var t = new Thread(() =>
+        {
+            try { action(); }
+            catch (Exception ex) { caught = ex; }
+        });
+
+        t.IsBackground = true;
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join();
+
+        if (caught is not null) throw caught;
     }
 }
