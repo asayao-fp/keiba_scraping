@@ -26,6 +26,12 @@ set JV_STATUS_POLL_MAX_WAIT_SEC=10
 set JV_STATUS_POLL_INTERVAL_SEC=0.5
 python tools/jvlink32/jvread_via_bridge.py
 
+# Enable step-by-step debug logs on stderr:
+set JVBRIDGE_DEBUG=1
+python tools/jvlink32/jvread_via_bridge.py
+# -- or via CLI flag --
+python tools/jvlink32/jvread_via_bridge.py --debug-steps
+
 # Or pass positional args (dataspec fromdate option):
 python tools/jvlink32/jvread_via_bridge.py RACE 20240101000000 1
 
@@ -73,6 +79,7 @@ def run_bridge(
     fromdate: str | None = None,
     option: str | None = None,
     extra_env: dict[str, str] | None = None,
+    debug_steps: bool = False,
 ) -> dict:
     """Run JVLinkBridge and return the parsed JSON result dict."""
     bridge_exe = _find_bridge()
@@ -80,6 +87,8 @@ def run_bridge(
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
+    if debug_steps:
+        env["JVBRIDGE_DEBUG"] = "1"
 
     args: list[str] = [str(bridge_exe)]
     if dataspec:
@@ -98,6 +107,10 @@ def run_bridge(
     )
 
     stderr_text = proc.stderr.strip()
+
+    # Always forward bridge stderr to our stderr so debug logs are visible
+    if stderr_text:
+        print(stderr_text, file=sys.stderr)
 
     if proc.returncode not in (0, 1):
         raise RuntimeError(
@@ -121,21 +134,30 @@ def run_bridge(
             f"stderr: {stderr_text or '(empty)'}"
         ) from exc
 
-    # Attach stderr to the result dict so callers can inspect it
-    if stderr_text:
-        result.setdefault("stderr", stderr_text)
-
     return result
 
 
 def main() -> int:
-    # Positional CLI args override env vars
-    dataspec = sys.argv[1] if len(sys.argv) > 1 else None
-    fromdate = sys.argv[2] if len(sys.argv) > 2 else None
-    option   = sys.argv[3] if len(sys.argv) > 3 else None
+    # Consume --debug-steps flag; remaining positional args go to the bridge
+    debug_steps = os.environ.get("JVBRIDGE_DEBUG", "").strip() == "1"
+    positional: list[str] = []
+    for arg in sys.argv[1:]:
+        if arg == "--debug-steps":
+            debug_steps = True
+        else:
+            positional.append(arg)
+
+    dataspec = positional[0] if len(positional) > 0 else None
+    fromdate = positional[1] if len(positional) > 1 else None
+    option   = positional[2] if len(positional) > 2 else None
 
     try:
-        result = run_bridge(dataspec=dataspec, fromdate=fromdate, option=option)
+        result = run_bridge(
+            dataspec=dataspec,
+            fromdate=fromdate,
+            option=option,
+            debug_steps=debug_steps,
+        )
     except FileNotFoundError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 2
