@@ -1,0 +1,6 @@
+{"step": "dispatch_ok"}
+{"step": "open_ok", "open_ret": 0, "downloadcount": 2}
+{"step": "dispatch_ok"}
+{"step": "open_ok", "open_ret": 0, "downloadcount": 24}
+{"step": "read_try2", "status": 0, "ret": 1, "size": 0}
+{"step": "read_try", "status": 0, "ret": 1, "size": 0}

@@ -9,6 +9,14 @@ import time
 import pythoncom  # type: ignore
 import win32com.client  # type: ignore
 
+import pathlib
+
+LOG_PATH = pathlib.Path(__file__).with_name("jvlink_open_debug.trace.jsonl")
+
+def log(obj: dict) -> None:
+    with LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.flush()
 
 def invoke_open(jv, dataspec: str, fromdate: str, option: int):
     return jv._oleobj_.InvokeTypes(
@@ -46,6 +54,7 @@ def main() -> int:
         interval_sec = float(os.environ.get("JV_READ_INTERVAL_SEC", "0.5"))
 
         jv = win32com.client.Dispatch("JVDTLab.JVLink")
+        log({"step": "dispatch_ok"})
         init_ret = jv.JVInit(0)
 
         ui_ret = None  # UIは呼ばない
@@ -56,6 +65,7 @@ def main() -> int:
         st0 = jv.JVStatus()
 
         open_ret, readcount, downloadcount, lastts = invoke_open(jv, dataspec, fromdate, option)
+        log({"step": "open_ok", "open_ret": int(open_ret), "downloadcount": int(downloadcount)})
 
         st1 = jv.JVStatus()
 
@@ -68,31 +78,38 @@ def main() -> int:
         filename = ""
 
         deadline = time.time() + max_wait_sec
-        while time.time() < deadline:
-            st = int(jv.JVStatus())
-            read_ret, buff, size, filename = invoke_read(jv)
 
-            attempts.append(
-                {
-                    "status": st,
-                    "ret": int(read_ret),
-                    "size": int(size),
-                    "filename": str(filename),
-                    "buff_head": str(buff)[:30],
-                }
-            )
+        log({"step": "read_try2", "status": st1, "ret": 1, "size": int(size)})
 
-            if int(read_ret) == 0 and int(size) > 0:
-                found = True
+        try:
+            while time.time() < deadline:
+                st = int(jv.JVStatus())
+                #read_ret, buff, size, filename = invoke_read(jv)
+                read_ret,buff,size,filename = 1,"",0,""  # ダミー値（実際の呼び出しは上の行）
+                attempts.append(
+                    {
+                        "status": st,
+                        "ret": int(read_ret),
+                        "size": int(size),
+                        "filename": str(filename),
+                        "buff_head": str(buff)[:30],
+                    }
+                )
+
+                log({"step": "read_try", "status": st, "ret": int(read_ret), "size": int(size)})
+                if int(read_ret) == 0 and int(size) > 0:
+                    found = True
+                    break
+
+                # -3 は待機して再試行
+                if int(read_ret) == -3:
+                    time.sleep(interval_sec)
+                    continue
+                # それ以外の負数はエラー扱いで中断
                 break
-
-            # -3 は待機して再試行
-            if int(read_ret) == -3:
-                time.sleep(interval_sec)
-                continue
-
-            # それ以外の負数はエラー扱いで中断
-            break
+        except Exception as e:
+            log({"step": "read_exception", "error": repr(e)})
+            raise
 
         st2 = jv.JVStatus()
 
