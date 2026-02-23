@@ -122,6 +122,7 @@ JSONには少なくとも `ok`, `stage`, `open.ret`, `open.readcount`, `open.dow
 | `JV_ENABLE_STATUS_POLL` | `0` | `1` にすると JVOpen 後に `JVStatus` を繰り返しポーリングする |
 | `JV_STATUS_POLL_MAX_WAIT_SEC` | `10` | `JVStatus` ポーリングの最大待機時間（秒） |
 | `JV_STATUS_POLL_INTERVAL_SEC` | `0.5` | `JVStatus` ポーリング間隔（秒） |
+| `JV_READ_REQUIRE_STATUS_ZERO` | `0` | `1` にすると `JVStatus()==0` が確認されるまで `JVRead` を呼ばない。ポーリング期間内に `0` にならない場合は `ok=false` / `stage="status_poll"` を出力して終了する |
 
 ---
 
@@ -182,19 +183,27 @@ dotnet --list-sdks
 
 `JVRead` で `COMException: 0x80010105` が発生する場合、以下の手順で診断情報を収集してください。
 
+> **JVRead の ByRef 呼び出しについて**
+> ブリッジは `System.Reflection.ParameterModifier` を使用して `JVRead` の全引数を
+> ByRef（参照渡し）としてマーシャリングします。これにより、レイトバインド反射での
+> ByRef 引数の不正マーシャリングが原因で発生する `RPC_E_SERVERFAULT` を回避できます。
+> 診断には各呼び出し試行の `read_args_types` と `read_args_values_preview` が含まれます。
+
 #### ステップ 1: 診断モードで実行
 
 ```powershell
-$env:JV_SLEEP_AFTER_OPEN_SEC     = "3"   # JVOpen 後に 3 秒待機
-$env:JV_ENABLE_STATUS_POLL       = "1"   # JVStatus をポーリングして状態遷移を確認
-$env:JV_STATUS_POLL_MAX_WAIT_SEC = "15"
-$env:JV_STATUS_POLL_INTERVAL_SEC = "1"
-$env:JV_ENABLE_UI_PROPERTIES     = "1"   # JVSetUIProperties を呼び出す（環境によって有効）
+$env:JV_SLEEP_AFTER_OPEN_SEC      = "3"   # JVOpen 後に 3 秒待機
+$env:JV_ENABLE_STATUS_POLL        = "1"   # JVStatus をポーリングして状態遷移を確認
+$env:JV_STATUS_POLL_MAX_WAIT_SEC  = "15"
+$env:JV_STATUS_POLL_INTERVAL_SEC  = "1"
+$env:JV_ENABLE_UI_PROPERTIES      = "1"   # JVSetUIProperties を呼び出す（環境によって有効）
+$env:JV_READ_REQUIRE_STATUS_ZERO  = "1"   # JVStatus==0 が確認されるまで JVRead を呼ばない
 .\JVLinkBridge.exe RACE 20240101000000 1
 ```
 
 出力 JSON の `status_poll` フィールドで、`JVStatus` の遷移を確認します。
 `status=0` が現れる前に `JVRead` を呼び出すとサーバーフォルトが発生することがあります。
+`JV_READ_REQUIRE_STATUS_ZERO=1` を設定すると、`status=0` が確認されるまで `JVRead` を呼ばないため、サーバーフォルトを回避できます。
 
 #### ステップ 2: JSON のフィールドを確認
 
@@ -204,7 +213,9 @@ $env:JV_ENABLE_UI_PROPERTIES     = "1"   # JVSetUIProperties を呼び出す（�
 | `hresult` | COMException の HRESULT 値（例: `0x80010105`） |
 | `error` | エラーメッセージ |
 | `open.readcount` | `JVOpen` が返したレコード数（0 の場合はデータなし） |
-| `status_poll` | `JVStatus` のポーリング結果（`JV_ENABLE_STATUS_POLL=1` のとき） |
+| `status_poll` | `JVStatus` のポーリング結果（`JV_ENABLE_STATUS_POLL=1` または `JV_READ_REQUIRE_STATUS_ZERO=1` のとき） |
+| `read.attempts_tail[].read_args_types` | `JVRead` 呼び出し後の各引数の型名（ByRef マーシャリングの確認に使用） |
+| `read.attempts_tail[].read_args_values_preview` | `JVRead` 呼び出し後の各引数の値プレビュー（filename, size, buff 先頭） |
 
 #### ステップ 3: JV-Link の状態を確認
 
