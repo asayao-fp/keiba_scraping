@@ -27,74 +27,6 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-[ComImport, Guid("00020400-0000-0000-C000-000000000046"),
- InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IDispatch
-{
-    [PreserveSig] int GetTypeInfoCount(out uint pctinfo);
-    [PreserveSig] int GetTypeInfo(uint iTInfo, uint lcid, out System.Runtime.InteropServices.ComTypes.ITypeInfo ppTInfo);
-    // The rest is not needed for introspection here
-    [PreserveSig] int GetIDsOfNames(ref Guid riid, IntPtr rgszNames, uint cNames, uint lcid, IntPtr rgDispId);
-    [PreserveSig] int Invoke();
-}
-
-static string VarEnumName(short vt) => ((VarEnum)vt).ToString();
-
-static void DumpDispatchSignature(object comObj, Action<string> log)
-{
-    try
-    {
-        var disp = (IDispatch)comObj;
-        disp.GetTypeInfoCount(out var cnt);
-        log($"IDispatch.GetTypeInfoCount={cnt}");
-        if (cnt == 0) return;
-
-        // 0 = default typeinfo
-        disp.GetTypeInfo(0, 0, out var ti);
-
-        // enumerate functions and find JVRead
-        ti.GetTypeAttr(out var pTypeAttr);
-        var typeAttr = Marshal.PtrToStructure<System.Runtime.InteropServices.ComTypes.TYPEATTR>(pTypeAttr);
-
-        for (int i = 0; i < typeAttr.cFuncs; i++)
-        {
-            ti.GetFuncDesc(i, out var pFuncDesc);
-            var fd = Marshal.PtrToStructure<System.Runtime.InteropServices.ComTypes.FUNCDESC>(pFuncDesc);
-
-            var names = new string[fd.cParams + 1];
-            ti.GetNames(fd.memid, names, names.Length, out var got);
-            var name = got > 0 ? names[0] : $"memid:{fd.memid}";
-
-            if (string.Equals(name, "JVRead", StringComparison.OrdinalIgnoreCase))
-            {
-                log("=== Runtime IDispatch signature for JVRead ===");
-                log($"return vt={VarEnumName(fd.elemdescFunc.tdesc.vt)}");
-
-                for (int p = 0; p < fd.cParams; p++)
-                {
-                    var elem = Marshal.PtrToStructure<System.Runtime.InteropServices.ComTypes.ELEMDESC>(
-                        fd.lprgelemdescParam + p * Marshal.SizeOf<System.Runtime.InteropServices.ComTypes.ELEMDESC>());
-
-                    var pname = (p + 1 < got) ? names[p + 1] : $"param{p}";
-                    log($"param[{p}] name={pname} vt={VarEnumName(elem.tdesc.vt)} wParamFlags=0x{elem.desc.paramdesc.wParamFlags:X}");
-                }
-            }
-
-            ti.ReleaseFuncDesc(pFuncDesc);
-        }
-
-        ti.ReleaseTypeAttr(pTypeAttr);
-    }
-    catch (Exception ex)
-    {
-        log("DumpDispatchSignature failed: " + ex);
-    }
-}
-
-
-// ── IDispatch introspection (to confirm runtime signature) ────────────────
-
-
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 static string Env(string key, string fallback) =>
@@ -187,8 +119,11 @@ try
     dynamic djv = jv;
     D("STEP 3: COM instance created");
 
-    D("STEP 3.1: Dump IDispatch signature (if available)");
-    DumpDispatchSignature(jv, D);
+    if (debugSteps)
+    {
+        D("STEP 3.1: Dump IDispatch signature (if available)");
+        DispatchIntrospection.DumpDispatchSignature(jv, D);
+    }
 
     object? Invoke(string method, params object[] p)
     {
@@ -532,4 +467,70 @@ record AttemptInfo
     public int?     Truncated             { get; set; }
     public string[] ReadArgsTypes         { get; set; } = [];
     public string[] ReadArgsValuesPreview { get; set; } = [];
+}
+
+// ── IDispatch introspection (to confirm runtime signature of JVRead) ─────────
+
+[ComImport, Guid("00020400-0000-0000-C000-000000000046"),
+ InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IDispatch
+{
+    [PreserveSig] int GetTypeInfoCount(out uint pctinfo);
+    [PreserveSig] int GetTypeInfo(uint iTInfo, uint lcid, out System.Runtime.InteropServices.ComTypes.ITypeInfo ppTInfo);
+    [PreserveSig] int GetIDsOfNames(ref Guid riid, IntPtr rgszNames, uint cNames, uint lcid, IntPtr rgDispId);
+    [PreserveSig] int Invoke();
+}
+
+static class DispatchIntrospection
+{
+    static string VarEnumName(short vt) => ((VarEnum)vt).ToString();
+
+    public static void DumpDispatchSignature(object comObj, Action<string> log)
+    {
+        try
+        {
+            var disp = (IDispatch)comObj;
+            disp.GetTypeInfoCount(out var cnt);
+            log($"IDispatch.GetTypeInfoCount={cnt}");
+            if (cnt == 0) return;
+
+            disp.GetTypeInfo(0, 0, out var ti);
+
+            ti.GetTypeAttr(out var pTypeAttr);
+            var typeAttr = Marshal.PtrToStructure<System.Runtime.InteropServices.ComTypes.TYPEATTR>(pTypeAttr);
+
+            for (int i = 0; i < typeAttr.cFuncs; i++)
+            {
+                ti.GetFuncDesc(i, out var pFuncDesc);
+                var fd = Marshal.PtrToStructure<System.Runtime.InteropServices.ComTypes.FUNCDESC>(pFuncDesc);
+
+                var names = new string[fd.cParams + 1];
+                ti.GetNames(fd.memid, names, names.Length, out var got);
+                var name = got > 0 ? names[0] : $"memid:{fd.memid}";
+
+                if (string.Equals(name, "JVRead", StringComparison.OrdinalIgnoreCase))
+                {
+                    log("=== Runtime IDispatch signature for JVRead ===");
+                    log($"return vt={VarEnumName(fd.elemdescFunc.tdesc.vt)}");
+
+                    for (int p = 0; p < fd.cParams; p++)
+                    {
+                        var elem = Marshal.PtrToStructure<System.Runtime.InteropServices.ComTypes.ELEMDESC>(
+                            fd.lprgelemdescParam + p * Marshal.SizeOf<System.Runtime.InteropServices.ComTypes.ELEMDESC>());
+
+                        var pname = (p + 1 < got) ? names[p + 1] : $"param{p}";
+                        log($"param[{p}] name={pname} vt={VarEnumName(elem.tdesc.vt)} wParamFlags=0x{elem.desc.paramdesc.wParamFlags:X}");
+                    }
+                }
+
+                ti.ReleaseFuncDesc(pFuncDesc);
+            }
+
+            ti.ReleaseTypeAttr(pTypeAttr);
+        }
+        catch (Exception ex)
+        {
+            log("DumpDispatchSignature failed: " + ex);
+        }
+    }
 }
