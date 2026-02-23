@@ -14,9 +14,11 @@
 //   JV_ENABLE_STATUS_POLL       1     (poll JVStatus after open until ready or timeout)
 //   JV_STATUS_POLL_MAX_WAIT_SEC 10
 //   JV_STATUS_POLL_INTERVAL_SEC 0.5
+//   JV_READ_REQUIRE_STATUS_ZERO 1     (gate JVRead: require JVStatus==0 before calling JVRead)
 //
 // Outputs a single JSON line to stdout, then exits 0 on success / 1 on error.
 
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -33,6 +35,12 @@ static double EnvDouble(string key, double fallback) =>
 static bool EnvBool(string key) =>
     Env(key, "0").Trim() == "1";
 
+static string[] GetReadArgsPreview(object[] args) => [
+    args.Length > 0 ? (Convert.ToString(args[0]) is { } s0 ? (s0.Length > 30 ? s0[..30] : s0) : "") : "",
+    args.Length > 1 ? (Convert.ToString(args[1]) ?? "") : "",
+    args.Length > 2 ? (Convert.ToString(args[2]) ?? "") : "",
+];
+
 // ── parameters ───────────────────────────────────────────────────────────────
 
 string dataspec              = Env("JV_DATASPEC",                "RACE");
@@ -46,6 +54,7 @@ bool   enableUiProperties    = EnvBool("JV_ENABLE_UI_PROPERTIES");
 bool   enableStatusPoll      = EnvBool("JV_ENABLE_STATUS_POLL");
 double statusPollMaxWaitSec  = EnvDouble("JV_STATUS_POLL_MAX_WAIT_SEC", 10.0);
 double statusPollIntervalSec = EnvDouble("JV_STATUS_POLL_INTERVAL_SEC",  0.5);
+bool   requireStatusZero     = EnvBool("JV_READ_REQUIRE_STATUS_ZERO");
 
 // CLI args override env vars (positional: dataspec fromdate option)
 if (args.Length >= 1) dataspec = args[0];
@@ -145,7 +154,7 @@ try
 
         // ── JVStatus polling ──────────────────────────────────────────────────
         var statusSnapshots = new List<StatusSnapshot>();
-        if (enableStatusPoll)
+        if (enableStatusPoll || requireStatusZero)
         {
             result.Stage = "status_poll";
             var pollDeadline = DateTime.UtcNow.AddSeconds(statusPollMaxWaitSec);
@@ -178,9 +187,26 @@ try
             result.StatusPoll = statusSnapshots;
         }
 
+        // ── gate: require JVStatus == 0 before calling JVRead ────────────────
+        bool proceedToRead = true;
+        if (requireStatusZero)
+        {
+            bool statusZeroSeen = statusSnapshots.Any(s => s.Status == 0);
+            if (!statusZeroSeen)
+            {
+                result.Ok    = false;
+                result.Stage = "status_poll";
+                result.Error = "JVStatus did not reach 0 within the poll window; JVRead not attempted (JV_READ_REQUIRE_STATUS_ZERO=1)";
+                proceedToRead = false;
+            }
+        }
+
+        if (proceedToRead)
+        {
         // ── JVRead with retry ─────────────────────────────────────────────────
         result.Stage = "read";
         // Signature: JVRead(ref buff, ref size, ref filename) -> int
+        // Use ParameterModifier to correctly marshal ByRef parameters (avoids RPC_E_SERVERFAULT)
         bool found     = false;
         int  readRet   = -9999;
         int  size      = 0;
@@ -191,18 +217,51 @@ try
 
         while (DateTime.UtcNow < deadline)
         {
-            object[] readArgs = ["", 0, ""];
-            readRet  = (int)(Invoke("JVRead", readArgs) ?? -9999);
+            var readArgs = new object[] { "", 0, "" };
+            var pm = new ParameterModifier(3);
+            pm[0] = true; pm[1] = true; pm[2] = true;
+
+            try
+            {
+                readRet = (int)(jvType.InvokeMember("JVRead",
+                    BindingFlags.InvokeMethod,
+                    null, jv, readArgs, [pm], null, null) ?? -9999);
+            }
+            catch
+            {
+                attempts.Add(new AttemptInfo
+                {
+                    Ret                   = readRet,
+                    Size                  = 0,
+                    Filename              = "",
+                    BuffHead              = "",
+                    ReadArgsTypes         = readArgs.Select(a => a?.GetType().FullName ?? "null").ToArray(),
+                    ReadArgsValuesPreview = GetReadArgsPreview(readArgs),
+                });
+                result.Read = new ReadInfo
+                {
+                    Found        = false,
+                    Ret          = readRet,
+                    Size         = 0,
+                    Filename     = "",
+                    BuffHead     = "",
+                    AttemptsTail = attempts.Count > 10 ? attempts[^10..] : attempts,
+                };
+                throw;
+            }
+
             buff     = Convert.ToString(readArgs[0]) ?? "";
             size     = Convert.ToInt32(readArgs[1]);
             filename = Convert.ToString(readArgs[2]) ?? "";
 
             attempts.Add(new AttemptInfo
             {
-                Ret      = readRet,
-                Size     = size,
-                Filename = filename,
-                BuffHead = buff.Length > 30 ? buff[..30] : buff,
+                Ret                   = readRet,
+                Size                  = size,
+                Filename              = filename,
+                BuffHead              = buff.Length > 30 ? buff[..30] : buff,
+                ReadArgsTypes         = readArgs.Select(a => a?.GetType().FullName ?? "null").ToArray(),
+                ReadArgsValuesPreview = GetReadArgsPreview(readArgs),
             });
 
             if (readRet == 0 && size > 0) { found = true; break; }
@@ -219,12 +278,18 @@ try
             BuffHead     = buff.Length > 200 ? buff[..200] : buff,
             AttemptsTail = attempts.Count > 10 ? attempts[^10..] : attempts,
         };
+        } // end if (proceedToRead)
     }
 
     // ── JVClose ──────────────────────────────────────────────────────────────
+    // Save error stage before "close" overwrites it, so the output Stage reflects
+    // where the failure actually occurred (e.g. "status_poll", "open"), not "close".
+    string? savedErrorStage = result.Error is not null ? result.Stage : null;
     result.Stage = "close";
     result.Close = (int)(Invoke("JVClose") ?? -9999);
     result.Ok    = result.Error is null;
+    // Restore the stage to where the failure originated (not "close")
+    if (savedErrorStage is not null) result.Stage = savedErrorStage;
 
     Marshal.ReleaseComObject(jv);
 }
@@ -303,8 +368,10 @@ record ReadInfo
 
 record AttemptInfo
 {
-    public int    Ret      { get; set; }
-    public int    Size     { get; set; }
-    public string Filename { get; set; } = "";
-    public string BuffHead { get; set; } = "";
+    public int      Ret                   { get; set; }
+    public int      Size                  { get; set; }
+    public string   Filename              { get; set; } = "";
+    public string   BuffHead              { get; set; } = "";
+    public string[] ReadArgsTypes         { get; set; } = [];
+    public string[] ReadArgsValuesPreview { get; set; } = [];
 }
