@@ -123,6 +123,8 @@ JSONには少なくとも `ok`, `stage`, `open.ret`, `open.readcount`, `open.dow
 | `JV_STATUS_POLL_MAX_WAIT_SEC` | `10` | `JVStatus` ポーリングの最大待機時間（秒） |
 | `JV_STATUS_POLL_INTERVAL_SEC` | `0.5` | `JVStatus` ポーリング間隔（秒） |
 | `JV_READ_REQUIRE_STATUS_ZERO` | `0` | `1` にすると `JVStatus()==0` が確認されるまで `JVRead` を呼ばない。ポーリング期間内に `0` にならない場合は `ok=false` / `stage="status_poll"` を出力して終了する |
+| `JV_READ_BUFFER_CAPACITY` | `1048576` | `JVRead` に渡す非管理バッファのサイズ（バイト）。有効範囲: 4096〜33554432（範囲外の値はクランプされます） |
+| `JV_READ_BUFFER_ENCODING` | `ansi` | バッファのデコード方式: `ansi`（`Marshal.PtrToStringAnsi`）または `unicode`（`Marshal.PtrToStringUni`） |
 
 ---
 
@@ -183,11 +185,12 @@ dotnet --list-sdks
 
 `JVRead` で `COMException: 0x80010105` が発生する場合、以下の手順で診断情報を収集してください。
 
-> **JVRead の ByRef 呼び出しについて**
-> ブリッジは `System.Reflection.ParameterModifier` を使用して `JVRead` の全引数を
-> ByRef（参照渡し）としてマーシャリングします。これにより、レイトバインド反射での
-> ByRef 引数の不正マーシャリングが原因で発生する `RPC_E_SERVERFAULT` を回避できます。
-> 診断には各呼び出し試行の `read_args_types` と `read_args_values_preview` が含まれます。
+> **JVRead の IntPtr バッファ呼び出しについて**
+> ブリッジは `Marshal.AllocHGlobal` で確保した非管理バッファ（`IntPtr`）を `JVRead` の第 1 引数として渡します。
+> これにより、`ref string` を COM の書き込み対象バッファとして渡した際に発生するメモリ破壊（終了コード `0xC0000404`）を回避できます。
+> `size` と `filename` は引き続き `ParameterModifier` で ByRef として渡されます。
+> 呼び出し後、バッファの内容は `Marshal.PtrToStringAnsi`（デフォルト）または `Marshal.PtrToStringUni` でデコードされます。
+> 診断には各呼び出し試行の `read_args_types`（第 1 引数は `System.IntPtr`）と `read_args_values_preview`（`size`, `filename`, `buffer_preview`）が含まれます。
 
 #### ステップ 1: 診断モードで実行
 
@@ -214,8 +217,11 @@ $env:JV_READ_REQUIRE_STATUS_ZERO  = "1"   # JVStatus==0 が確認されるまで
 | `error` | エラーメッセージ |
 | `open.readcount` | `JVOpen` が返したレコード数（0 の場合はデータなし） |
 | `status_poll` | `JVStatus` のポーリング結果（`JV_ENABLE_STATUS_POLL=1` または `JV_READ_REQUIRE_STATUS_ZERO=1` のとき） |
-| `read.attempts_tail[].read_args_types` | `JVRead` 呼び出し後の各引数の型名（ByRef マーシャリングの確認に使用） |
-| `read.attempts_tail[].read_args_values_preview` | `JVRead` 呼び出し後の各引数の値プレビュー（filename, size, buff 先頭） |
+| `read.attempts_tail[].read_args_types` | `JVRead` 呼び出し後の各引数の型名（第 1 引数は `System.IntPtr`） |
+| `read.attempts_tail[].read_args_values_preview` | `JVRead` 呼び出し後の引数プレビュー（`size`, `filename`, バッファ先頭文字列） |
+| `read.attempts_tail[].buffer_preview` | デコードされたバッファの先頭 200 文字 |
+| `read.attempts_tail[].decode_error` | バッファのデコードに失敗した場合のエラーメッセージ |
+| `read.attempts_tail[].truncated` | `JVRead` の戻り値がバッファ容量を超えた場合の実際の戻り値 |
 
 #### ステップ 3: JV-Link の状態を確認
 

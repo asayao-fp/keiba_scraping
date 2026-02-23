@@ -15,6 +15,8 @@
 //   JV_STATUS_POLL_MAX_WAIT_SEC 10
 //   JV_STATUS_POLL_INTERVAL_SEC 0.5
 //   JV_READ_REQUIRE_STATUS_ZERO 1     (gate JVRead: require JVStatus==0 before calling JVRead)
+//   JV_READ_BUFFER_CAPACITY     1048576  (JVRead buffer size in bytes; clamped 4096..33554432)
+//   JV_READ_BUFFER_ENCODING     ansi     (buffer decoding: "ansi" or "unicode")
 //
 // Outputs a single JSON line to stdout, then exits 0 on success / 1 on error.
 
@@ -35,10 +37,13 @@ static double EnvDouble(string key, double fallback) =>
 static bool EnvBool(string key) =>
     Env(key, "0").Trim() == "1";
 
-static string[] GetReadArgsPreview(object[] args) => [
-    args.Length > 0 ? (Convert.ToString(args[0]) is { } s0 ? (s0.Length > 30 ? s0[..30] : s0) : "") : "",
-    args.Length > 1 ? (Convert.ToString(args[1]) ?? "") : "",
-    args.Length > 2 ? (Convert.ToString(args[2]) ?? "") : "",
+static int EnvInt(string key, int fallback) =>
+    int.TryParse(Env(key, ""), out var i) ? i : fallback;
+
+static string[] GetReadArgsPreview(int size, string filename, string bufferPreview) => [
+    size.ToString(),
+    filename,
+    bufferPreview.Length > 50 ? bufferPreview[..50] : bufferPreview,
 ];
 
 // ── parameters ───────────────────────────────────────────────────────────────
@@ -55,6 +60,9 @@ bool   enableStatusPoll      = EnvBool("JV_ENABLE_STATUS_POLL");
 double statusPollMaxWaitSec  = EnvDouble("JV_STATUS_POLL_MAX_WAIT_SEC", 10.0);
 double statusPollIntervalSec = EnvDouble("JV_STATUS_POLL_INTERVAL_SEC",  0.5);
 bool   requireStatusZero     = EnvBool("JV_READ_REQUIRE_STATUS_ZERO");
+int    bufCapacityRaw        = EnvInt("JV_READ_BUFFER_CAPACITY", 1048576);
+int    bufCapacity           = Math.Clamp(bufCapacityRaw, 4096, 33554432);
+bool   useUnicode            = Env("JV_READ_BUFFER_ENCODING", "ansi").Trim().ToLowerInvariant() == "unicode";
 
 // CLI args override env vars (positional: dataspec fromdate option)
 if (args.Length >= 1) dataspec = args[0];
@@ -205,8 +213,10 @@ try
         {
         // ── JVRead with retry ─────────────────────────────────────────────────
         result.Stage = "read";
-        // Signature: JVRead(ref buff, ref size, ref filename) -> int
-        // Use ParameterModifier to correctly marshal ByRef parameters (avoids RPC_E_SERVERFAULT)
+        // Signature: JVRead(buff, ref size, ref filename) -> int
+        // buff is passed as a pre-allocated IntPtr (unmanaged buffer) to avoid
+        // memory corruption caused by passing ref string to a COM LPSTR write target
+        // (which caused exit 0xC0000404 with ParameterModifier-based ref string).
         bool found     = false;
         int  readRet   = -9999;
         int  size      = 0;
@@ -215,58 +225,95 @@ try
         var   deadline  = DateTime.UtcNow.AddSeconds(maxWaitSec);
         var   attempts  = new List<AttemptInfo>();
 
+        // Pre-allocate a zero-fill buffer once; reused to initialize the unmanaged buffer each iteration
+        var zeroBytes = new byte[bufCapacity];
+
         while (DateTime.UtcNow < deadline)
         {
-            var readArgs = new object[] { "", 0, "" };
-            var pm = new ParameterModifier(3);
-            pm[0] = true; pm[1] = true; pm[2] = true;
-
+            IntPtr bufPtr = Marshal.AllocHGlobal(bufCapacity);
             try
             {
-                readRet = (int)(jvType.InvokeMember("JVRead",
-                    BindingFlags.InvokeMethod,
-                    null, jv, readArgs, [pm], null, null) ?? -9999);
-            }
-            catch
-            {
+                // Zero-initialize so PtrToStringAnsi/Uni is safe even if COM writes nothing
+                Marshal.Copy(zeroBytes, 0, bufPtr, bufCapacity);
+
+                // buff passed by value (IntPtr = pointer); size and filename ByRef
+                var readArgs = new object[] { bufPtr, 0, "" };
+                var pm = new ParameterModifier(3);
+                pm[0] = false; pm[1] = true; pm[2] = true;
+
+                string localBuff = "";
+                string? decodeError = null;
+
+                try
+                {
+                    readRet = (int)(jvType.InvokeMember("JVRead",
+                        BindingFlags.InvokeMethod,
+                        null, jv, readArgs, [pm], null, null) ?? -9999);
+                }
+                catch
+                {
+                    attempts.Add(new AttemptInfo
+                    {
+                        Ret                   = readRet,
+                        Size                  = 0,
+                        Filename              = "",
+                        BuffHead              = "",
+                        ReadArgsTypes         = readArgs.Select(a => a?.GetType().FullName ?? "null").ToArray(),
+                        ReadArgsValuesPreview = GetReadArgsPreview(0, "", ""),
+                    });
+                    result.Read = new ReadInfo
+                    {
+                        Found        = false,
+                        Ret          = readRet,
+                        Size         = 0,
+                        Filename     = "",
+                        BuffHead     = "",
+                        AttemptsTail = attempts.Count > 10 ? attempts[^10..] : attempts,
+                    };
+                    throw;
+                }
+
+                // Decode the unmanaged buffer into a managed string.
+                // Zero-initialization above guarantees a null terminator so PtrToStringAnsi/Uni
+                // will always stop at the end of COM-written data even if COM omits the terminator.
+                try
+                {
+                    localBuff = useUnicode
+                        ? Marshal.PtrToStringUni(bufPtr) ?? ""
+                        : Marshal.PtrToStringAnsi(bufPtr) ?? "";
+                }
+                catch (Exception decEx)
+                {
+                    decodeError = decEx.Message;
+                    localBuff = "";
+                }
+
+                buff     = localBuff;
+                size     = Convert.ToInt32(readArgs[1]);
+                filename = Convert.ToString(readArgs[2]) ?? "";
+                bool wouldTruncate = readRet > 0 && readRet > bufCapacity;
+
                 attempts.Add(new AttemptInfo
                 {
                     Ret                   = readRet,
-                    Size                  = 0,
-                    Filename              = "",
-                    BuffHead              = "",
+                    Size                  = size,
+                    Filename              = filename,
+                    BuffHead              = buff.Length > 30 ? buff[..30] : buff,
+                    BufferPreview         = buff.Length > 200 ? buff[..200] : buff,
+                    DecodeError           = decodeError,
+                    Truncated             = wouldTruncate ? readRet : null,
                     ReadArgsTypes         = readArgs.Select(a => a?.GetType().FullName ?? "null").ToArray(),
-                    ReadArgsValuesPreview = GetReadArgsPreview(readArgs),
+                    ReadArgsValuesPreview = GetReadArgsPreview(size, filename, buff),
                 });
-                result.Read = new ReadInfo
-                {
-                    Found        = false,
-                    Ret          = readRet,
-                    Size         = 0,
-                    Filename     = "",
-                    BuffHead     = "",
-                    AttemptsTail = attempts.Count > 10 ? attempts[^10..] : attempts,
-                };
-                throw;
+
+                if (readRet == 0 && size > 0) { found = true; break; }
+                if (readRet == -3) { Thread.Sleep((int)(intervalSec * 1000)); continue; }
+                break; // any other value → stop retrying
             }
-
-            buff     = Convert.ToString(readArgs[0]) ?? "";
-            size     = Convert.ToInt32(readArgs[1]);
-            filename = Convert.ToString(readArgs[2]) ?? "";
-
-            attempts.Add(new AttemptInfo
+            finally
             {
-                Ret                   = readRet,
-                Size                  = size,
-                Filename              = filename,
-                BuffHead              = buff.Length > 30 ? buff[..30] : buff,
-                ReadArgsTypes         = readArgs.Select(a => a?.GetType().FullName ?? "null").ToArray(),
-                ReadArgsValuesPreview = GetReadArgsPreview(readArgs),
-            });
-
-            if (readRet == 0 && size > 0) { found = true; break; }
-            if (readRet == -3) { Thread.Sleep((int)(intervalSec * 1000)); continue; }
-            break; // any other value → stop retrying
+                Marshal.FreeHGlobal(bufPtr);
+            }
         }
 
         result.Read = new ReadInfo
@@ -276,6 +323,7 @@ try
             Size         = size,
             Filename     = filename,
             BuffHead     = buff.Length > 200 ? buff[..200] : buff,
+            DecodeError  = attempts.Count > 0 ? attempts[^1].DecodeError : null,
             AttemptsTail = attempts.Count > 10 ? attempts[^10..] : attempts,
         };
         } // end if (proceedToRead)
@@ -363,6 +411,7 @@ record ReadInfo
     public int               Size         { get; set; }
     public string            Filename     { get; set; } = "";
     public string            BuffHead     { get; set; } = "";
+    public string?           DecodeError  { get; set; }
     public List<AttemptInfo> AttemptsTail { get; set; } = [];
 }
 
@@ -372,6 +421,9 @@ record AttemptInfo
     public int      Size                  { get; set; }
     public string   Filename              { get; set; } = "";
     public string   BuffHead              { get; set; } = "";
+    public string?  BufferPreview         { get; set; }
+    public string?  DecodeError           { get; set; }
+    public int?     Truncated             { get; set; }
     public string[] ReadArgsTypes         { get; set; } = [];
     public string[] ReadArgsValuesPreview { get; set; } = [];
 }
