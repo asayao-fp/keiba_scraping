@@ -105,6 +105,7 @@ var result = new BridgeResult();
 try
 {
     D("STEP 0: program start");
+    D("apartment=" + Thread.CurrentThread.GetApartmentState());
     D($"params: dataspec={dataspec}, fromdate={fromdate}, option={option}, savePath={savePath}");
     D($"flags: enableUiProperties={enableUiProperties}, enableStatusPoll={enableStatusPoll}, requireStatusZero={requireStatusZero}");
 
@@ -154,7 +155,7 @@ try
         D("STEP init: JVSetUIProperties (optional)");
         try
         {
-            uiPropertiesRet = (int)(Invoke("JVSetUIProperties", 0, 0, 0, 0) ?? -9999);
+            uiPropertiesRet = (int)(Invoke("JVSetUIProperties") ?? -9999);
         }
         catch (Exception uiEx)
         {
@@ -508,7 +509,10 @@ static class DispatchIntrospection
                 ti.GetNames(fd.memid, names, names.Length, out var got);
                 var name = got > 0 ? names[0] : $"memid:{fd.memid}";
 
-                if (string.Equals(name, "JVRead", StringComparison.OrdinalIgnoreCase))
+                log($"IDispatch func[{i}] name={name} memid={fd.memid} cParams={fd.cParams} returnvt={VarEnumName(fd.elemdescFunc.tdesc.vt)}");
+
+                if (string.Equals(name, "JVRead", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(name, "JVSetUIProperties", StringComparison.OrdinalIgnoreCase))
                 {
                     log("=== Runtime IDispatch signature for JVRead ===");
                     log($"return vt={VarEnumName(fd.elemdescFunc.tdesc.vt)}");
