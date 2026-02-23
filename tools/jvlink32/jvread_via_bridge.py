@@ -76,7 +76,7 @@ def run_bridge(
 ) -> dict:
     """Run JVLinkBridge and return the parsed JSON result dict."""
     bridge_exe = _find_bridge()
-
+    print("[jvread_via_bridge] exe_path:", bridge_exe)
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)

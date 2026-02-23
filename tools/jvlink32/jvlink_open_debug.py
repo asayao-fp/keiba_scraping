@@ -26,7 +26,7 @@ def invoke_open(jv, dataspec: str, fromdate: str, option: int):
         dataspec, fromdate, option, 0, 0, ""
     )
 
-
+"""
 def invoke_read(jv):
     return jv._oleobj_.InvokeTypes(
         9, 0, 1,
@@ -34,6 +34,11 @@ def invoke_read(jv):
         ((16392, 2), (16387, 2), (16392, 2)),
         "", 0, ""
     )
+"""
+
+def invoke_read(jv):
+    # makepyラッパに任せる（クラッシュ回避狙い）
+    return jv.JVRead()
 
 # ...（import と invoke_open/invoke_read はそのまま）...
 
@@ -53,7 +58,8 @@ def main() -> int:
         max_wait_sec = float(os.environ.get("JV_READ_MAX_WAIT_SEC", "60"))
         interval_sec = float(os.environ.get("JV_READ_INTERVAL_SEC", "0.5"))
 
-        jv = win32com.client.Dispatch("JVDTLab.JVLink")
+        #jv = win32com.client.Dispatch("JVDTLab.JVLink")
+        jv = win32com.client.gencache.EnsureDispatch("JVDTLab.JVLink")
         log({"step": "dispatch_ok"})
         init_ret = jv.JVInit(0)
 
@@ -66,6 +72,11 @@ def main() -> int:
 
         open_ret, readcount, downloadcount, lastts = invoke_open(jv, dataspec, fromdate, option)
         log({"step": "open_ok", "open_ret": int(open_ret), "downloadcount": int(downloadcount)})
+
+        time.sleep(3)
+        read_ret, buff, size, filename = invoke_read(jv)
+
+        log({"step": "open_ok", "read_ret": int(read_ret), "filename": int(filename)})
 
         st1 = jv.JVStatus()
 
@@ -84,8 +95,8 @@ def main() -> int:
         try:
             while time.time() < deadline:
                 st = int(jv.JVStatus())
-                #read_ret, buff, size, filename = invoke_read(jv)
-                read_ret,buff,size,filename = 1,"",0,""  # ダミー値（実際の呼び出しは上の行）
+                read_ret, buff, size, filename = invoke_read(jv)
+                #read_ret,buff,size,filename = 1,"",0,""  # ダミー値（実際の呼び出しは上の行）
                 attempts.append(
                     {
                         "status": st,
