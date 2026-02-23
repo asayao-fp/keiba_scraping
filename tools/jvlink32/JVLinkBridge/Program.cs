@@ -1,0 +1,213 @@
+// JVLinkBridge – thin COM bridge that calls JVRead inside the .NET CLR,
+// avoiding the 0xC0000409 crash that occurs when JVRead is invoked from
+// Python/pywin32.
+//
+// Usage (environment variables or CLI args override defaults):
+//   JV_DATASPEC          RACE            (JVOpen dataspec)
+//   JV_FROMDATE          20240101000000  (JVOpen fromdate)
+//   JV_OPTION            1               (JVOpen option)
+//   JV_SAVE_PATH         C:\ProgramData\JRA-VAN\Data
+//   JV_READ_MAX_WAIT_SEC 60
+//   JV_READ_INTERVAL_SEC 0.5
+//
+// Outputs a single JSON line to stdout, then exits 0 on success / 1 on error.
+
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+static string Env(string key, string fallback) =>
+    Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : fallback;
+
+static double EnvDouble(string key, double fallback) =>
+    double.TryParse(Env(key, ""), out var d) ? d : fallback;
+
+// ── parameters ───────────────────────────────────────────────────────────────
+
+string dataspec   = Env("JV_DATASPEC",          "RACE");
+string fromdate   = Env("JV_FROMDATE",           "20240101000000");
+int    option     = int.TryParse(Env("JV_OPTION", "1"), out var o) ? o : 1;
+string savePath   = Env("JV_SAVE_PATH",          @"C:\ProgramData\JRA-VAN\Data");
+double maxWaitSec = EnvDouble("JV_READ_MAX_WAIT_SEC", 60.0);
+double intervalSec = EnvDouble("JV_READ_INTERVAL_SEC", 0.5);
+
+// CLI args override env vars (positional: dataspec fromdate option)
+if (args.Length >= 1) dataspec = args[0];
+if (args.Length >= 2) fromdate = args[1];
+if (args.Length >= 3 && int.TryParse(args[2], out var oa)) option = oa;
+
+// ── COM activation ───────────────────────────────────────────────────────────
+
+var result = new BridgeResult();
+
+try
+{
+    Type jvType = Type.GetTypeFromProgID("JVDTLab.JVLink")
+        ?? throw new InvalidOperationException("JVDTLab.JVLink ProgID not found. Is JV-Link installed?");
+
+    object jv = Activator.CreateInstance(jvType)
+        ?? throw new InvalidOperationException("Failed to create JVDTLab.JVLink instance.");
+
+    object? Invoke(string method, params object[] p) =>
+        jvType.InvokeMember(method,
+            System.Reflection.BindingFlags.InvokeMethod, null, jv, p);
+
+    // ── setup ────────────────────────────────────────────────────────────────
+    int initRet      = (int)(Invoke("JVInit",        0)     ?? -9999);
+    int savePathRet  = (int)(Invoke("JVSetSavePath", savePath) ?? -9999);
+    int saveFlagRet  = (int)(Invoke("JVSetSaveFlag", 1)     ?? -9999);
+    int payFlagRet   = (int)(Invoke("JVSetPayFlag",  0)     ?? -9999);
+
+    result.Setup = new SetupInfo
+    {
+        Init      = initRet,
+        SavePath  = savePathRet,
+        SaveFlag  = saveFlagRet,
+        PayFlag   = payFlagRet,
+    };
+
+    // ── JVOpen ───────────────────────────────────────────────────────────────
+    // Signature: JVOpen(dataspec, fromdate, option,
+    //                   ref readcount, ref downloadcount, ref lastfiletimestamp)
+    object[] openArgs = [dataspec, fromdate, option, 0, 0, ""];
+    int openRet = (int)(Invoke("JVOpen", openArgs) ?? -9999);
+    int readcount    = Convert.ToInt32(openArgs[3]);
+    int downloadcount= Convert.ToInt32(openArgs[4]);
+    string lastts    = Convert.ToString(openArgs[5]) ?? "";
+
+    result.Open = new OpenInfo
+    {
+        Dataspec      = dataspec,
+        Fromdate      = fromdate,
+        Option        = option,
+        Ret           = openRet,
+        Readcount     = readcount,
+        Downloadcount = downloadcount,
+        Lastfiletimestamp = lastts,
+    };
+
+    if (openRet < 0)
+    {
+        result.Error = $"JVOpen returned {openRet}";
+    }
+    else
+    {
+        // ── JVRead with retry ────────────────────────────────────────────────
+        // Signature: JVRead(ref buff, ref size, ref filename) -> int
+        bool found    = false;
+        int  readRet  = -9999;
+        int  size     = 0;
+        string buff   = "";
+        string filename = "";
+        var   deadline = DateTime.UtcNow.AddSeconds(maxWaitSec);
+        var   attempts = new List<AttemptInfo>();
+
+        while (DateTime.UtcNow < deadline)
+        {
+            object[] readArgs = ["", 0, ""];
+            readRet = (int)(Invoke("JVRead", readArgs) ?? -9999);
+            buff    = Convert.ToString(readArgs[0]) ?? "";
+            size    = Convert.ToInt32(readArgs[1]);
+            filename= Convert.ToString(readArgs[2]) ?? "";
+
+            attempts.Add(new AttemptInfo
+            {
+                Ret      = readRet,
+                Size     = size,
+                Filename = filename,
+                BuffHead = buff.Length > 30 ? buff[..30] : buff,
+            });
+
+            if (readRet == 0 && size > 0) { found = true; break; }
+            if (readRet == -3) { Thread.Sleep((int)(intervalSec * 1000)); continue; }
+            break; // any other value → stop retrying
+        }
+
+        result.Read = new ReadInfo
+        {
+            Found       = found,
+            Ret         = readRet,
+            Size        = size,
+            Filename    = filename,
+            BuffHead    = buff.Length > 200 ? buff[..200] : buff,
+            AttemptsTail= attempts.Count > 10 ? attempts[^10..] : attempts,
+        };
+    }
+
+    // ── JVClose ──────────────────────────────────────────────────────────────
+    result.Close = (int)(Invoke("JVClose") ?? -9999);
+    result.Ok    = result.Error is null;
+
+    Marshal.ReleaseComObject(jv);
+}
+catch (Exception ex)
+{
+    result.Ok    = false;
+    result.Error = ex.ToString();
+}
+
+// ── output ───────────────────────────────────────────────────────────────────
+
+var jsonOptions = new JsonSerializerOptions
+{
+    WriteIndented          = false,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    PropertyNamingPolicy   = JsonNamingPolicy.SnakeCaseLower,
+    Encoder                = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+};
+
+Console.OutputEncoding = Encoding.UTF8;
+Console.WriteLine(JsonSerializer.Serialize(result, jsonOptions));
+return result.Ok ? 0 : 1;
+
+// ── record types ─────────────────────────────────────────────────────────────
+
+record BridgeResult
+{
+    public bool        Ok      { get; set; }
+    public string?     Error   { get; set; }
+    public SetupInfo?  Setup   { get; set; }
+    public OpenInfo?   Open    { get; set; }
+    public ReadInfo?   Read    { get; set; }
+    public int?        Close   { get; set; }
+}
+
+record SetupInfo
+{
+    public int Init     { get; set; }
+    public int SavePath { get; set; }
+    public int SaveFlag { get; set; }
+    public int PayFlag  { get; set; }
+}
+
+record OpenInfo
+{
+    public string Dataspec          { get; set; } = "";
+    public string Fromdate          { get; set; } = "";
+    public int    Option            { get; set; }
+    public int    Ret               { get; set; }
+    public int    Readcount         { get; set; }
+    public int    Downloadcount     { get; set; }
+    public string Lastfiletimestamp { get; set; } = "";
+}
+
+record ReadInfo
+{
+    public bool            Found        { get; set; }
+    public int             Ret          { get; set; }
+    public int             Size         { get; set; }
+    public string          Filename     { get; set; } = "";
+    public string          BuffHead     { get; set; } = "";
+    public List<AttemptInfo> AttemptsTail { get; set; } = [];
+}
+
+record AttemptInfo
+{
+    public int    Ret      { get; set; }
+    public int    Size     { get; set; }
+    public string Filename { get; set; } = "";
+    public string BuffHead { get; set; } = "";
+}

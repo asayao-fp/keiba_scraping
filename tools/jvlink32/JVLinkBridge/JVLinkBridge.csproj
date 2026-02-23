@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- x86 required: JV-Link COM server is 32-bit only -->
+    <PlatformTarget>x86</PlatformTarget>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>JVLinkBridge</AssemblyName>
+  </PropertyGroup>
+
+</Project>
